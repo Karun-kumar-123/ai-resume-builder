@@ -1,19 +1,23 @@
 import streamlit as st
 from io import BytesIO
-from datetime import datetime
-import re, base64
+import re
 
-# Files / parsing
+# DOCX
 from docx import Document
 from docx.shared import Pt, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-import docx2txt
-from PyPDF2 import PdfReader
-from PIL import Image
 
-# NLP / features
+# Parsing
+from PyPDF2 import PdfReader
+
+# NLP
 from sklearn.feature_extraction.text import TfidfVectorizer
-from xhtml2pdf import pisa
+
+# PDF (ReportLab – Streamlit Cloud friendly)
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, ListFlowable, ListItem, Image as RLImage
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import cm
 
 st.set_page_config(page_title="AI Resume Builder PRO", page_icon="🧾", layout="wide")
 
@@ -78,11 +82,12 @@ def extract_text_from_pdf(file):
         return ""
 
 def extract_text_from_docx(file):
+    # Simple, robust extraction via python-docx
     try:
-        return docx2txt.process(file)
-    except Exception:
         d = Document(file)
         return "\n".join(p.text for p in d.paragraphs)
+    except Exception:
+        return ""
 
 def tfidf_keywords(text, top_n=20):
     text = (text or "").strip()
@@ -149,78 +154,99 @@ def title_block(doc, name, title, email, phone, links, align=WD_ALIGN_PARAGRAPH.
         p2 = doc.add_paragraph(meta)
         p2.alignment = align
 
-def html_resume(data, grouped_skills, misc_skills, jd_terms):
-    # very simple, printable HTML used for PDF export
-    def esc(s): return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
-    blocks = []
-    blocks.append(f"<h1 style='margin:0'>{esc(data['name'])}</h1>")
-    subtitle = " • ".join([x for x in [esc(data['title']), esc(data['email']), esc(data['phone']), esc(data['links'])] if x])
-    if subtitle:
-        blocks.append(f"<div style='margin-bottom:8px'>{subtitle}</div>")
+# ---------------- PDF (ReportLab) ----------------
+def build_pdf_bytes(data, grouped_skills, misc_skills, jd_terms, photo_file=None):
+    buf = BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4,
+                            leftMargin=1.7*cm, rightMargin=1.7*cm,
+                            topMargin=1.7*cm, bottomMargin=1.7*cm)
+    styles = getSampleStyleSheet()
+    title = ParagraphStyle('Title', parent=styles['Heading1'], fontSize=18, spaceAfter=6)
+    h3 = ParagraphStyle('H3', parent=styles['Heading3'], spaceBefore=8, spaceAfter=4)
+    body = styles['BodyText']
+
+    flow = []
+    # Optional photo (small, left)
+    if photo_file is not None:
+        try:
+            # Convert to bytes for RLImage
+            pf_bytes = photo_file.read()
+            photo_file.seek(0)
+            img = RLImage(BytesIO(pf_bytes), width=2.8*cm, height=2.8*cm)
+            flow.append(img)
+            flow.append(Spacer(1, 6))
+        except Exception:
+            pass
+
+    # Header
+    flow.append(Paragraph(data['name'], title))
+    subtitle_parts = [x for x in [data.get('title'), data.get('email'), data.get('phone'), data.get('links')] if x]
+    if subtitle_parts:
+        flow.append(Paragraph(" • ".join(subtitle_parts), body))
+        flow.append(Spacer(1, 6))
+
+    # Summary
     if data.get("summary"):
-        blocks.append("<h3>Summary</h3>")
-        blocks.append(f"<p>{esc(data['summary'])}</p>")
-    blocks.append("<h3>Skills</h3><ul>")
+        flow.append(Paragraph("Summary", h3))
+        flow.append(Paragraph(data["summary"], body))
+
+    # Skills
+    flow.append(Paragraph("Skills", h3))
+    items = []
     for k, vals in grouped_skills.items():
         if vals:
-            blocks.append(f"<li><b>{k}:</b> {', '.join(vals)}</li>")
+            items.append(Paragraph(f"<b>{k}:</b> {', '.join(sorted(vals))}", body))
     if misc_skills:
-        blocks.append(f"<li><b>Other:</b> {', '.join(misc_skills)}</li>")
-    blocks.append("</ul>")
+        items.append(Paragraph(f"<b>Other:</b> {', '.join(sorted(misc_skills))}", body))
+    if data.get("soft"):
+        items.append(Paragraph(f"<b>Soft:</b> {', '.join(data['soft'])}", body))
+    if items:
+        flow.append(ListFlowable([ListItem(i) for i in items], bulletType='bullet'))
+    flow.append(Spacer(1, 4))
 
+    # Experience
     if data["exp"]:
-        blocks.append("<h3>Experience</h3>")
+        flow.append(Paragraph("Experience", h3))
         for e in data["exp"]:
-            header = " | ".join([x for x in [esc(e['role']), esc(e['company']), esc(e['loc'])] if x])
-            if e.get("dur"): header += f" • {esc(e['dur'])}"
-            blocks.append(f"<p><b>{header}</b></p><ul>")
-            for b in e["bullets"]:
-                blocks.append(f"<li>{esc(improve_bullet(b, jd_terms))}</li>")
-            blocks.append("</ul>")
+            header = " | ".join([x for x in [e.get('role'), e.get('company'), e.get('loc')] if x])
+            if e.get("dur"): header += f" • {e['dur']}"
+            flow.append(Paragraph(f"<b>{header}</b>", body))
+            blts = [improve_bullet(b, jd_terms) for b in e.get("bullets", [])]
+            if blts:
+                flow.append(ListFlowable([ListItem(Paragraph(b, body)) for b in blts], bulletType='bullet'))
 
+    # Projects
     if data["projects"]:
-        blocks.append("<h3>Projects</h3>")
+        flow.append(Paragraph("Projects", h3))
         for p in data["projects"]:
-            line = esc(p['name'] or 'Project')
-            if p.get("stack"): line += f" — {esc(p['stack'])}"
-            if p.get("link"): line += f" • {esc(p['link'])}"
-            blocks.append(f"<p><b>{line}</b></p><ul>")
-            for b in p["bullets"]:
-                blocks.append(f"<li>{esc(improve_bullet(b, jd_terms))}</li>")
-            blocks.append("</ul>")
+            line = p.get("name") or "Project"
+            if p.get("stack"): line += f" — {p['stack']}"
+            if p.get("link"): line += f" • {p['link']}"
+            flow.append(Paragraph(f"<b>{line}</b>", body))
+            blts = [improve_bullet(b, jd_terms) for b in p.get("bullets", [])]
+            if blts:
+                flow.append(ListFlowable([ListItem(Paragraph(b, body)) for b in blts], bulletType='bullet'))
 
+    # Education
     if data.get("edu_degree") or data.get("edu_school") or data.get("edu_grad"):
-        blocks.append("<h3>Education</h3><ul>")
-        edu_line = " | ".join([esc(x) for x in [data["edu_degree"], data["edu_school"]] if x])
-        if data.get("edu_grad"): edu_line += f" • Graduated {esc(data['edu_grad'])}"
-        blocks.append(f"<li>{edu_line}</li></ul>")
+        flow.append(Paragraph("Education", h3))
+        edu_line = " | ".join([x for x in [data.get("edu_degree"), data.get("edu_school")] if x])
+        if data.get("edu_grad"): edu_line += f" • Graduated {data['edu_grad']}"
+        flow.append(Paragraph(edu_line, body))
 
-    if data["certs"]:
-        blocks.append("<h3>Certifications</h3><ul>")
-        for c in data["certs"]:
-            blocks.append(f"<li>{esc(c)}</li>")
-        blocks.append("</ul>")
+    # Certifications
+    if data.get("certs"):
+        flow.append(Paragraph("Certifications", h3))
+        flow.append(ListFlowable([ListItem(Paragraph(c, body)) for c in data["certs"]], bulletType='bullet'))
 
+    # Signature (optional)
     if data.get("signature_name"):
-        blocks.append(f"<p style='margin-top:24px'><i>Signed by {esc(data['signature_name'])}</i></p>")
-    return f"""
-    <html><head>
-    <meta charset="utf-8" />
-    <style>
-    body {{ font-family: Arial, Helvetica, sans-serif; font-size:12pt; }}
-    h1 {{ font-size:20pt; margin-bottom:4px; }}
-    h3 {{ margin: 12px 0 6px 0; }}
-    ul {{ margin-top: 0; }}
-    </style></head><body>
-    {''.join(blocks)}
-    </body></html>
-    """
+        flow.append(Spacer(1, 8))
+        flow.append(Paragraph(f"<i>Signed: {data['signature_name']}</i>", body))
 
-def html_to_pdf_bytes(html: str) -> bytes:
-    out = BytesIO()
-    pisa.CreatePDF(src=html, dest=out)
-    out.seek(0)
-    return out.read()
+    doc.build(flow)
+    buf.seek(0)
+    return buf.read()
 
 # ------------------------------- Sidebar --------------------------------
 with st.sidebar:
@@ -260,8 +286,12 @@ with st.form("resume_form"):
         photo_file = st.file_uploader("Profile Photo (optional)", type=["png","jpg","jpeg"])
         signature_name = st.text_input("Signature name (optional)", "")
     with c2:
-        summary = st.text_area("Objective / Summary", (imported_text[:280] + "...") if imported_text else
-                               "Enthusiastic developer with hands-on experience in Python, data analysis, and web apps.", height=110)
+        summary = st.text_area(
+            "Objective / Summary",
+            (imported_text[:280] + "...") if imported_text else
+            "Enthusiastic developer with hands-on experience in Python, data analysis, and web apps.",
+            height=110
+        )
 
     st.markdown("### Skills")
     tech_skills = st.text_area("All Skills (comma separated)", "Python, JavaScript, HTML, CSS, SQL, Pandas, NumPy, Streamlit, AWS, Docker, React")
@@ -340,10 +370,11 @@ if submitted:
             "summary": summary if include_objective else "",
             "exp": exp, "projects": projects,
             "edu_degree": edu_degree, "edu_school": edu_school, "edu_grad": edu_grad,
-            "certs": certs, "signature_name": signature_name
+            "certs": certs, "signature_name": signature_name,
+            "soft": soft,
         }
 
-        # DOCX generation
+        # ---------------- DOCX generation ----------------
         doc = Document()
         for section in doc.sections:
             section.top_margin = Inches(0.5)
@@ -363,25 +394,25 @@ if submitted:
         # Summary
         if include_objective and summary.strip():
             add_heading(doc, "Summary", size=12, align=WD_ALIGN_PARAGRAPH.LEFT if template!="Modern" else WD_ALIGN_PARAGRAPH.CENTER)
-            p = doc.add_paragraph(summary.strip())
+            doc.add_paragraph(summary.strip())
 
         # ------------ BOLD SKILLS BLOCK ------------
-        def add_skills_block(doc):
-            add_heading(doc, "Skills", size=12)
-            # Category names in **bold**
+        def add_skills_block(docx_doc):
+            add_heading(docx_doc, "Skills", size=12)
+            # Category names bold
             for k, vals in grouped.items():
                 if vals:
-                    p = doc.add_paragraph()
+                    p = docx_doc.add_paragraph()
                     cat = p.add_run(f"{k}: ")
                     cat.bold = True
                     p.add_run(", ".join(sorted(vals)))
             if misc:
-                p = doc.add_paragraph()
+                p = docx_doc.add_paragraph()
                 cat = p.add_run("Other: ")
                 cat.bold = True
                 p.add_run(", ".join(sorted(misc)))
             if soft:
-                p = doc.add_paragraph()
+                p = docx_doc.add_paragraph()
                 cat = p.add_run("Soft: ")
                 cat.bold = True
                 p.add_run(", ".join(soft))
@@ -482,9 +513,8 @@ if submitted:
         # DOCX bytes
         docx_bytes = BytesIO(); doc.save(docx_bytes); docx_bytes.seek(0)
 
-        # HTML + PDF
-        html = html_resume(data, grouped, misc, jd_terms)
-        pdf_bytes = html_to_pdf_bytes(html)
+        # ---------------- PDF generation (ReportLab) ----------------
+        pdf_bytes = build_pdf_bytes(data, grouped, misc, jd_terms, photo_file=photo_file)
 
         st.success("Your tailored resume is ready!")
         cdl, cdr = st.columns(2)
