@@ -4,5 +4,6 @@ docx2txt
 PyPDF2
 Pillow
 scikit-learn
-xhtml2pdf
+reportlab
+
 
